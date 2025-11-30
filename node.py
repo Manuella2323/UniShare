@@ -1,109 +1,79 @@
-import socket
-import json
-import uuid
-import os
-import threading
+import grpc
+from concurrent import futures
 import time
+import os
 import glob
+import sys
+import json
+import urllib.request
+import storage_pb2
+import storage_pb2_grpc
 
-SERVER_IP = '127.0.0.1'
-SERVER_PORT = 6000
+# Hide gRPC C++ errors from console
+os.environ['GRPC_VERBOSITY'] = 'NONE'
 
-def get_existing_node_dirs():
-    return [d for d in os.listdir('.') if os.path.isdir(d) and d.startswith('node_storage_')]
+SERVER_API_URL = "http://127.0.0.1:5000/register_node"
 
-def run_single_node(node_id, is_new=False):
-    storage_dir = f"node_storage_{node_id}" 
-    if not os.path.exists(storage_dir):
-        os.makedirs(storage_dir)
+class StorageService(storage_pb2_grpc.StorageNodeServicer):
+    def __init__(self, port):
+        self.port = port
+        self.storage_dir = f"node_storage_{port}"
+        if not os.path.exists(self.storage_dir):
+            os.makedirs(self.storage_dir)
 
-    print(f"[Launcher] {'Resurrecting' if not is_new else 'Starting'} Node {node_id}...")
+    def StoreChunk(self, request, context):
+        path = f"{self.storage_dir}/{request.filename}.part{request.index}"
+        with open(path, 'wb') as f:
+            f.write(request.data)
+        return storage_pb2.Response(success=True, message="Saved")
 
-    while True:
-        sock = None
+    def RetrieveChunk(self, request, context):
+        path = f"{self.storage_dir}/{request.filename}.part{request.index}"
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                data = f.read()
+            return storage_pb2.ChunkData(filename=request.filename, index=request.index, data=data)
+        else:
+            context.abort(grpc.StatusCode.NOT_FOUND, "Chunk not found")
+
+    def DeleteChunk(self, request, context):
+        pattern = f"{self.storage_dir}/{request.filename}.part*"
+        for f in glob.glob(pattern):
+            try: os.remove(f)
+            except: pass
+        print(f"[{self.port}] 🗑️ Deleted {request.filename}")
+        return storage_pb2.Response(success=True, message="Deleted")
+
+def register_with_server(port):
+    try:
+        data = json.dumps({'port': port}).encode('utf-8')
+        req = urllib.request.Request(SERVER_API_URL, data=data, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req)
+        print(f"✅ Registered on port {port}")
+    except:
+        print(f"⚠️ Port {port} active (Server offline)")
+
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    
+    # Auto-find port
+    port = 50051
+    while port < 50100:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((SERVER_IP, SERVER_PORT))
-            
-            # Register
-            reg = json.dumps({'node_id': node_id, 'capacity': 10 * 1024 * 1024 * 1024})
-            sock.send(reg.encode())
-            sock.recv(1024) # Wait for ACK
-            
-            if is_new: print(f"✅ [{node_id}] Online.")
-
-            buffer = b""
-            while True:
-                # 1. READ HEADER (Small chunks)
-                while b'\n' not in buffer:
-                    chunk = sock.recv(4096)
-                    if not chunk: raise Exception("Disconnect")
-                    buffer += chunk
-                
-                header_part, buffer = buffer.split(b'\n', 1)
-                
-                try:
-                    cmd = json.loads(header_part.decode())
-                    
-                    if cmd['cmd'] == 'store':
-                        # 2. READ BODY (Large chunks - Optimized loop)
-                        payload_size = cmd['size']
-                        while len(buffer) < payload_size:
-                            # Read up to 1MB at a time for speed
-                            buffer += sock.recv(1024 * 1024) 
-                        
-                        file_data = buffer[:payload_size]
-                        buffer = buffer[payload_size:]
-                        
-                        fname = f"{cmd['file']}.part{cmd['index']}"
-                        with open(os.path.join(storage_dir, fname), 'wb') as f:
-                            f.write(file_data)
-                        
-                        # NO PRINTING here for speed.
-
-                    elif cmd['cmd'] == 'retrieve':
-                        fname = f"{cmd['file']}.part{cmd['index']}"
-                        path = os.path.join(storage_dir, fname)
-                        if os.path.exists(path):
-                            with open(path, 'rb') as f:
-                                raw = f.read()
-                            header = json.dumps({'size': len(raw)})
-                            sock.sendall(header.encode() + b'\n')
-                            sock.sendall(raw)
-                        else:
-                            header = json.dumps({'status': 'error', 'error': 'not_found'})
-                            sock.sendall(header.encode() + b'\n')
-
-                    elif cmd['cmd'] == 'delete':
-                        pattern = os.path.join(storage_dir, f"{cmd['file']}.part*")
-                        for f in glob.glob(pattern): os.remove(f)
-
-                except Exception:
-                    pass # Ignore malformed packets to keep node alive
-
-        except Exception:
-            time.sleep(5)
-        finally:
-            if sock: sock.close()
+            server.add_insecure_port(f'[::]:{port}')
+            break
+        except RuntimeError:
+            port += 1
+    
+    storage_pb2_grpc.add_StorageNodeServicer_to_server(StorageService(port), server)
+    server.start()
+    print(f"🚀 Node started on port {port}")
+    
+    register_with_server(port)
+    
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt: pass
 
 if __name__ == '__main__':
-    existing_dirs = get_existing_node_dirs()
-    threads = []
-    
-    for d in existing_dirs:
-        node_id = d.replace('node_storage_', '')
-        t = threading.Thread(target=run_single_node, args=(node_id, False), daemon=True)
-        t.start()
-        threads.append(t)
-        
-    nodes_needed = 3 - len(existing_dirs)
-    for i in range(nodes_needed):
-        new_id = f"node_{uuid.uuid4().hex[:6]}"
-        t = threading.Thread(target=run_single_node, args=(new_id, True), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.5)
-
-    try:
-        while True: time.sleep(1)
-    except KeyboardInterrupt: pass
+    serve()

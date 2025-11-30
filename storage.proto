@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package cloud;
+
+// The Service: What the Node can do
+service StorageNode {
+  rpc StoreChunk (ChunkData) returns (Response);
+  rpc RetrieveChunk (ChunkRequest) returns (ChunkData);
+  rpc DeleteChunk (ChunkRequest) returns (Response);
+}
+
+// Data Structures
+message ChunkData {
+  string filename = 1;
+  int32 index = 2;
+  bytes data = 3;
+}
+
+message ChunkRequest {
+  string filename = 1;
+  int32 index = 2;
+}
+
+message Response {
+  bool success = 1;
+  string message = 2;
+}

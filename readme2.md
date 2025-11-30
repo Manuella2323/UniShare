@@ -20,4 +20,12 @@ npx create-react-app frontend (you can delete the frontend folder presently in t
 - Replace the code: Open frontend/src/App.js in your IDE, delete everything that is in it and replace it with the code found in the file test.js found in the folder frontend_test.
 
 ### How to Run (The "Workflow")
+- in your project folder open the termonal and navigate to the frontend folder : cd frontend
+- In the frontend directory, run : npm start 
+- In a different teminal directly in your project folder directory run python server.py to launch network
+- This will run the node.py file in the background
+
+### Install gRPC tools
+- You need to install these libraries in the project folder terminal: pip install grpcio grpcio-tools
+
 
