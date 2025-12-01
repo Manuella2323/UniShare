@@ -25,8 +25,8 @@ const styles = {
   ctrlBtn: { background: 'none', border: 'none', color: '#fff', cursor: 'pointer', marginLeft: '10px', fontSize: '16px' }
 };
 
-const BATCH_SIZE = 4; // Parallel requests
-const CHUNK_SIZE = 1024 * 1024; // 1MB Chunk size
+const BATCH_SIZE = 4;
+const CHUNK_SIZE = 1024 * 1024; // 1MB
 
 function App() {
   const [files, setFiles] = useState([]);
@@ -34,8 +34,6 @@ function App() {
   const [tasks, setTasks] = useState([]); 
   const [isPaused, setIsPaused] = useState(false);
   const [processing, setProcessing] = useState(false);
-  
-  // AbortControllers for instant cancellation
   const controllers = useRef({}); 
 
   useEffect(() => {
@@ -57,18 +55,7 @@ function App() {
     if (!file) return;
     const taskId = Date.now();
     controllers.current[taskId] = new AbortController();
-
-    setTasks([...tasks, { 
-      id: taskId,
-      type: 'upload', 
-      name: file.name, 
-      file: file, 
-      progress: 0, 
-      status: 'pending', 
-      doneBytes: 0, 
-      totalBytes: file.size, 
-      currentChunk: 0 
-    }]);
+    setTasks([...tasks, { id: taskId, type: 'upload', name: file.name, file: file, progress: 0, status: 'pending', doneBytes: 0, totalBytes: file.size }]);
   };
 
   const handleDownload = async (filename) => {
@@ -77,19 +64,7 @@ function App() {
       const info = infoRes.data;
       const taskId = Date.now();
       controllers.current[taskId] = new AbortController();
-
-      setTasks([...tasks, { 
-        id: taskId,
-        type: 'download', 
-        name: filename, 
-        progress: 0, 
-        status: 'pending', 
-        doneBytes: 0, 
-        totalBytes: info.size, 
-        totalChunks: info.total_chunks, 
-        chunks: [], 
-        currentChunk: 0 
-      }]);
+      setTasks([...tasks, { id: taskId, type: 'download', name: filename, progress: 0, status: 'pending', doneBytes: 0, totalBytes: info.size, totalChunks: info.total_chunks, chunks: [] }]);
     } catch (e) { alert("File info not found"); }
   };
 
@@ -100,43 +75,30 @@ function App() {
     }
     const index = tasks.findIndex(t => t.id === taskId);
     if (index === -1) return;
-
     const task = tasks[index];
     const newTasks = [...tasks];
     newTasks[index].status = 'cancelled';
     setTasks(newTasks);
-
     if (task.type === 'upload') {
-      try {
-        await axios.delete(`http://localhost:5000/delete_file?filename=${task.name}`);
-        fetchStatus();
-      } catch (e) {}
+      try { await axios.delete(`http://localhost:5000/delete_file?filename=${task.name}`); fetchStatus(); } catch (e) {}
     }
   };
 
   const handleDelete = async (filename, e) => {
     e.stopPropagation();
     if (!window.confirm(`Delete ${filename}?`)) return;
-    try {
-      await axios.delete(`http://localhost:5000/delete_file?filename=${filename}`);
-      fetchStatus();
-    } catch (e) { alert("Failed to delete"); }
+    try { await axios.delete(`http://localhost:5000/delete_file?filename=${filename}`); fetchStatus(); } catch (e) { alert("Failed"); }
   };
 
   const processTasks = async () => {
     if (isPaused || processing) return;
-
-    // Find first active/pending task
     const activeIndex = tasks.findIndex(t => (t.status === 'pending' || t.status === 'active') && t.status !== 'cancelled' && t.status !== 'failed');
     if (activeIndex === -1) return;
 
     const task = tasks[activeIndex];
     setProcessing(true);
 
-    // Re-create controller if needed
-    if (!controllers.current[task.id]) {
-        controllers.current[task.id] = new AbortController();
-    }
+    if (!controllers.current[task.id]) controllers.current[task.id] = new AbortController();
     const signal = controllers.current[task.id].signal;
 
     if (task.status === 'pending') {
@@ -146,107 +108,72 @@ function App() {
     }
 
     try {
-      // --- UPLOAD LOGIC ---
       if (task.type === 'upload') {
         const totalChunks = Math.ceil(task.file.size / CHUNK_SIZE);
         const currentChunkIdx = Math.floor(task.doneBytes / CHUNK_SIZE);
 
         if (currentChunkIdx < totalChunks) {
           const promises = [];
-          let bytesAddedInThisBatch = 0;
-
+          let bytesAdded = 0;
           for (let i = 0; i < BATCH_SIZE; i++) {
               const batchIdx = currentChunkIdx + i;
               if (batchIdx >= totalChunks) break;
-              
               const start = batchIdx * CHUNK_SIZE;
               const end = Math.min(start + CHUNK_SIZE, task.file.size);
               const chunk = task.file.slice(start, end);
-
               const formData = new FormData();
               formData.append('chunk', chunk);
               formData.append('filename', task.name);
               formData.append('index', batchIdx);
               formData.append('total_chunks', totalChunks);
               formData.append('total_size', task.file.size);
-
-              // Granular Progress Update
-              const p = axios.post('http://localhost:5000/upload_chunk', formData, { signal })
-                .then(() => {
-                    bytesAddedInThisBatch += (end - start);
-                    setTasks(prevTasks => {
-                        const idx = prevTasks.findIndex(t => t.id === task.id);
-                        if (idx === -1 || prevTasks[idx].status === 'cancelled') return prevTasks;
-                        const updated = [...prevTasks];
-                        const newDone = task.doneBytes + bytesAddedInThisBatch;
-                        updated[idx].progress = Math.round((newDone / task.file.size) * 100);
-                        return updated;
-                    });
-                });
-              promises.push(p);
+              promises.push(axios.post('http://localhost:5000/upload_chunk', formData, { signal }).then(() => {
+                  bytesAdded += (end - start);
+                  setTasks(prev => {
+                      const idx = prev.findIndex(t => t.id === task.id);
+                      if (idx === -1 || prev[idx].status === 'cancelled') return prev;
+                      const up = [...prev];
+                      up[idx].progress = Math.round(((task.doneBytes + bytesAdded) / task.file.size) * 100);
+                      return up;
+                  });
+              }));
           }
-
           await Promise.all(promises);
-          
-          const chunksProcessed = promises.length;
-          const nextStartBytes = Math.min((currentChunkIdx + chunksProcessed) * CHUNK_SIZE, task.file.size);
-
-          setTasks(prevTasks => {
-             const idx = prevTasks.findIndex(t => t.id === task.id);
-             if (idx === -1 || prevTasks[idx].status === 'cancelled') return prevTasks;
-             
-             const updated = [...prevTasks];
-             updated[idx].doneBytes = nextStartBytes;
-             updated[idx].currentChunk = currentChunkIdx + chunksProcessed;
-             
-             if (nextStartBytes >= task.file.size) {
-                 updated[idx].status = 'completed';
-                 updated[idx].progress = 100;
-                 delete controllers.current[task.id]; 
+          const processed = promises.length;
+          setTasks(prev => {
+             const idx = prev.findIndex(t => t.id === task.id);
+             if (idx === -1 || prev[idx].status === 'cancelled') return prev;
+             const up = [...prev];
+             up[idx].doneBytes += bytesAdded; // approx
+             if (currentChunkIdx + processed >= totalChunks) {
+                 up[idx].status = 'completed';
+                 up[idx].progress = 100;
+                 delete controllers.current[task.id];
                  setTimeout(fetchStatus, 500); 
              }
-             return updated;
+             return up;
           });
         }
       } 
-      // --- DOWNLOAD LOGIC ---
       else if (task.type === 'download') {
         const currentChunkIdx = task.chunks.length;
         if (currentChunkIdx < task.totalChunks) {
-          
           const promises = [];
           for (let i = 0; i < BATCH_SIZE; i++) {
               const batchIdx = currentChunkIdx + i;
               if (batchIdx >= task.totalChunks) break;
-              
-              promises.push(axios.get(`http://localhost:5000/download_chunk`, {
-                  params: { filename: task.name, index: batchIdx },
-                  responseType: 'blob',
-                  signal
-              }).then(res => ({ idx: batchIdx, data: res.data })));
+              promises.push(axios.get(`http://localhost:5000/download_chunk`, { params: { filename: task.name, index: batchIdx }, responseType: 'blob', signal }).then(res => ({ idx: batchIdx, data: res.data })));
           }
-
           const results = await Promise.all(promises);
-
-          setTasks(prevTasks => {
-            const idx = prevTasks.findIndex(t => t.id === task.id);
-            if (idx === -1 || prevTasks[idx].status === 'cancelled') return prevTasks;
-            
-            const updated = [...prevTasks];
-            
-            // IMPORTANT: Sort chunks by index so they are stitched correctly
+          setTasks(prev => {
+            const idx = prev.findIndex(t => t.id === task.id);
+            if (idx === -1 || prev[idx].status === 'cancelled') return prev;
+            const up = [...prev];
             results.sort((a,b) => a.idx - b.idx);
-            
-            results.forEach(r => {
-                updated[idx].chunks.push(r.data);
-                updated[idx].doneBytes += r.data.size;
-            });
-
-            updated[idx].progress = Math.round((updated[idx].doneBytes / task.totalBytes) * 100);
-
-            if (updated[idx].chunks.length >= task.totalChunks) {
-                // Assembly
-                const blob = new Blob(updated[idx].chunks);
+            results.forEach(r => { up[idx].chunks.push(r.data); up[idx].doneBytes += r.data.size; });
+            up[idx].progress = Math.round((up[idx].doneBytes / task.totalBytes) * 100);
+            if (up[idx].chunks.length >= task.totalChunks) {
+                const blob = new Blob(up[idx].chunks);
                 const url = window.URL.createObjectURL(blob);
                 const link = document.createElement('a');
                 link.href = url;
@@ -254,35 +181,23 @@ function App() {
                 document.body.appendChild(link);
                 link.click();
                 link.remove();
-                
-                updated[idx].status = 'completed';
+                up[idx].status = 'completed';
                 delete controllers.current[task.id];
             }
-            return updated;
+            return up;
           });
         }
       }
     } catch (err) {
         if (!axios.isCancel(err)) {
-            console.error("Task error", err);
-            // Handle specific Server Errors (404/503)
-            setTasks(prev => {
-                const idx = prev.findIndex(t => t.id === task.id);
-                if (idx === -1) return prev;
-                const updated = [...prev];
-                updated[idx].status = 'failed';
-                return updated;
-            });
+            setTasks(prev => { const idx = prev.findIndex(t => t.id === task.id); if(idx!==-1) prev[idx].status='failed'; return [...prev]; });
             alert(`Transfer Failed: ${err.message}`);
         }
     }
-
     setProcessing(false);
   };
 
-  useEffect(() => { 
-    if(!processing && !isPaused) processTasks(); 
-  }, [tasks, isPaused, processing]);
+  useEffect(() => { if(!processing && !isPaused) processTasks(); }, [tasks, isPaused, processing]);
 
   const formatSize = (bytes) => {
     if (bytes === 0) return '0 B';
@@ -292,34 +207,23 @@ function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  const addSpace = async () => {
-    await axios.post('http://localhost:5000/add_space');
-    alert("New storage node launching...");
-    fetchStatus();
-  };
-
+  const addSpace = async () => { await axios.post('http://localhost:5000/add_space'); alert("Launching node..."); fetchStatus(); };
   const activeTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'cancelled' && t.status !== 'failed');
 
   return (
     <div style={styles.container}>
       <div style={styles.sidebar}>
         <div style={styles.logo}>☁️ SkyDrive</div>
-        <label style={styles.addBtn}>
-          <span style={{ fontSize: '20px' }}>+</span> New Upload
-          <input type="file" style={{ display: 'none' }} onChange={handleUpload} />
-        </label>
+        <label style={styles.addBtn}><span style={{ fontSize: '20px' }}>+</span> New Upload<input type="file" style={{ display: 'none' }} onChange={handleUpload} /></label>
         <button style={{...styles.addBtn, justifyContent: 'center'}} onClick={addSpace}>Add Space</button>
         <div style={styles.statBox}>
           <div style={{fontSize: '13px', color: '#5f6368'}}>Storage</div>
           <div style={{fontWeight: 'bold', margin: '5px 0'}}>{formatSize(stats.used)} used</div>
           <div style={{fontSize: '12px', color: '#5f6368'}}>of {formatSize(stats.quota)}</div>
-          <div style={styles.progressBarBg}>
-            <div style={{...styles.progressBarFill, width: `${(stats.used / stats.quota) * 100}%`}}></div>
-          </div>
+          <div style={styles.progressBarBg}><div style={{...styles.progressBarFill, width: `${(stats.used / stats.quota) * 100}%`}}></div></div>
           <div style={{fontSize: '11px', marginTop: '10px', color: '#1a73e8'}}>● {stats.nodes_online} Active Nodes</div>
         </div>
       </div>
-
       <div style={styles.main}>
         <div style={styles.sectionTitle}>My Files</div>
         <div style={styles.fileGrid}>
@@ -333,16 +237,11 @@ function App() {
               </div>
             </div>
           ))}
-          {files.length === 0 && <div style={{color: '#999'}}>No files yet. Upload something!</div>}
         </div>
       </div>
-
       {activeTasks.length > 0 && (
         <div style={styles.progressCard}>
-          <div style={styles.progressHeader}>
-            <span>Active Tasks</span>
-            <button onClick={() => setIsPaused(!isPaused)} style={styles.ctrlBtn}>{isPaused ? "▶" : "⏸"}</button>
-          </div>
+          <div style={styles.progressHeader}><span>Active Tasks</span><button onClick={() => setIsPaused(!isPaused)} style={styles.ctrlBtn}>{isPaused ? "▶" : "⏸"}</button></div>
           <div style={styles.progressBody}>
             {activeTasks.map((task) => (
               <div key={task.id} style={{marginBottom: '15px'}}>
@@ -350,12 +249,8 @@ function App() {
                   <span style={{fontWeight: 'bold'}}>{task.type === 'upload' ? '⬆' : '⬇'} {task.name}</span>
                   <button onClick={() => handleCancel(task.id)} style={{color: 'red', border:'none', background:'none', cursor:'pointer'}}>Cancel</button>
                 </div>
-                <div style={{fontSize: '11px', color: '#666', marginBottom: '5px'}}>
-                  {task.progress}%
-                </div>
-                <div style={{height: '4px', background: '#f1f3f4', borderRadius: '2px'}}>
-                  <div style={{width: `${task.progress}%`, height: '100%', background: task.type === 'upload' ? '#1a73e8' : '#0f9d58', transition: 'width 0.2s'}}></div>
-                </div>
+                <div style={{fontSize: '11px', color: '#666', marginBottom: '5px'}}>{task.progress}%</div>
+                <div style={{height: '4px', background: '#f1f3f4', borderRadius: '2px'}}><div style={{width: `${task.progress}%`, height: '100%', background: task.type === 'upload' ? '#1a73e8' : '#0f9d58', transition: 'width 0.2s'}}></div></div>
               </div>
             ))}
           </div>
@@ -364,5 +259,4 @@ function App() {
     </div>
   );
 }
-
 export default App;
